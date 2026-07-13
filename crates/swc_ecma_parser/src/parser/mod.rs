@@ -67,6 +67,24 @@ pub struct Parser<I: self::input::Tokens> {
     state: State,
     input: self::input::Buffer<I>,
     found_module_item: bool,
+    /// Reused scratch buffer for parsing call/`new` argument lists. Nested
+    /// argument lists share it via start-offset + `split_off`, so each list is
+    /// materialized at exact capacity (no `Vec` doubling slack) without paying
+    /// per-list growth reallocations.
+    arg_buf: Vec<ExprOrSpread>,
+    /// Reused scratch buffer for parsing statement block bodies. Works the same
+    /// way as [`Self::arg_buf`]: nested blocks append above their start offset
+    /// and `split_off` their tail, so every block's `Vec<Stmt>` ends up at
+    /// exact capacity with no growth reallocations.
+    stmt_buf: Vec<Stmt>,
+    /// Reused scratch buffer for parsing variable declarator lists (see
+    /// [`Self::arg_buf`]). Most `var`/`let`/`const` statements declare a single
+    /// binding, so exact sizing avoids `Vec`'s minimum-capacity-of-4 slack
+    /// (a `VarDeclarator` is 80 bytes, so that slack is expensive).
+    var_decl_buf: Vec<VarDeclarator>,
+    /// Reused scratch buffer for parsing function parameter lists (see
+    /// [`Self::arg_buf`]).
+    param_buf: Vec<Param>,
     #[cfg(feature = "flow")]
     allow_super_call: bool,
 }
@@ -189,6 +207,10 @@ impl<I: Tokens> Parser<I> {
             state: Default::default(),
             input: crate::parser::input::Buffer::new(input),
             found_module_item: false,
+            arg_buf: Vec::new(),
+            stmt_buf: Vec::new(),
+            var_decl_buf: Vec::new(),
+            param_buf: Vec::new(),
             #[cfg(feature = "flow")]
             allow_super_call: false,
         };

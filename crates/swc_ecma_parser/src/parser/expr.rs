@@ -998,29 +998,49 @@ impl<I: Tokens> Parser<I> {
                 return Ok(Vec::new());
             }
 
+            // Parse arguments into the shared scratch buffer, then `split_off`
+            // the tail into an exact-capacity `Vec`. Nested argument lists (e.g.
+            // `f(g(x))`) push onto the same buffer above `buf_start`, which is
+            // safe because parsing is strictly LIFO. On error we truncate back
+            // to `buf_start` so the buffer stays consistent for any recovery.
+            let buf_start = p.arg_buf.len();
             let mut first = true;
-            let mut expr_or_spreads = Vec::with_capacity(2);
 
-            while !p.input().is(Token::RParen) {
-                if first {
-                    first = false;
-                } else {
-                    expect!(p, Token::Comma);
-                    // Handle trailing comma.
-                    if p.input().is(Token::RParen) {
-                        if is_dynamic_import && !p.input().syntax().import_attributes() {
-                            syntax_error!(p, p.span(start), SyntaxError::TrailingCommaInsideImport)
+            let res = (|p: &mut Self| -> PResult<()> {
+                while !p.input().is(Token::RParen) {
+                    if first {
+                        first = false;
+                    } else {
+                        expect!(p, Token::Comma);
+                        // Handle trailing comma.
+                        if p.input().is(Token::RParen) {
+                            if is_dynamic_import && !p.input().syntax().import_attributes() {
+                                syntax_error!(
+                                    p,
+                                    p.span(start),
+                                    SyntaxError::TrailingCommaInsideImport
+                                )
+                            }
+
+                            break;
                         }
-
-                        break;
                     }
+
+                    let arg = p.allow_in_expr(|p| p.parse_expr_or_spread())?;
+                    p.arg_buf.push(arg);
                 }
 
-                expr_or_spreads.push(p.allow_in_expr(|p| p.parse_expr_or_spread())?);
-            }
+                expect!(p, Token::RParen);
+                Ok(())
+            })(p);
 
-            expect!(p, Token::RParen);
-            Ok(expr_or_spreads)
+            match res {
+                Ok(()) => Ok(p.arg_buf.split_off(buf_start)),
+                Err(err) => {
+                    p.arg_buf.truncate(buf_start);
+                    Err(err)
+                }
+            }
         })
     }
 
