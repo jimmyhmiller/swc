@@ -264,37 +264,49 @@ impl<I: Tokens> Parser<I> {
             }
         }
 
-        let mut decls = Vec::with_capacity(4);
-        loop {
-            // Handle
-            //      var a,;
-            //
-            // NewLine is ok
-            if self.input().is(Token::Semi) {
-                let prev_span = self.input().prev_span();
-                let span = if prev_span == var_span {
-                    Span::new_with_checked(prev_span.hi, prev_span.hi)
+        // Parse declarators into the shared scratch buffer, then `split_off` the
+        // tail into an exact-capacity `Vec`. See `Parser::var_decl_buf`.
+        let buf_start = self.var_decl_buf.len();
+        let res = (|p: &mut Self| -> PResult<()> {
+            loop {
+                // Handle
+                //      var a,;
+                //
+                // NewLine is ok
+                if p.input().is(Token::Semi) {
+                    let prev_span = p.input().prev_span();
+                    let span = if prev_span == var_span {
+                        Span::new_with_checked(prev_span.hi, prev_span.hi)
+                    } else {
+                        prev_span
+                    };
+                    p.emit_err(span, SyntaxError::TS1009);
+                    break;
+                }
+
+                let decl = if should_include_in {
+                    p.do_inside_of_context(Context::IncludeInExpr, |p| {
+                        p.parse_var_declarator(for_loop, kind)
+                    })
                 } else {
-                    prev_span
-                };
-                self.emit_err(span, SyntaxError::TS1009);
-                break;
-            }
-
-            let decl = if should_include_in {
-                self.do_inside_of_context(Context::IncludeInExpr, |p| {
                     p.parse_var_declarator(for_loop, kind)
-                })
-            } else {
-                self.parse_var_declarator(for_loop, kind)
-            }?;
+                }?;
 
-            decls.push(decl);
+                p.var_decl_buf.push(decl);
 
-            if !self.input_mut().eat(Token::Comma) {
-                break;
+                if !p.input_mut().eat(Token::Comma) {
+                    break;
+                }
             }
+            Ok(())
+        })(self);
+
+        if let Err(err) = res {
+            self.var_decl_buf.truncate(buf_start);
+            return Err(err);
         }
+
+        let decls = self.var_decl_buf.split_off(buf_start);
 
         if !for_loop && !self.eat_general_semi() {
             self.emit_err(self.input().cur_span(), SyntaxError::TS1005);
@@ -2172,7 +2184,71 @@ impl<I: Tokens> Parser<I> {
         allow_directives: bool,
         end: Option<Token>,
     ) -> PResult<Vec<Stmt>> {
-        self.parse_block_body(allow_directives, end, handle_import_export)
+        trace_cur!(self, parse_stmt_block_body);
+
+        // Parse statements into the shared scratch buffer and `split_off` the
+        // tail into an exact-capacity `Vec<Stmt>`. Nested blocks append above
+        // `buf_start`; this is safe because block parsing is strictly LIFO. On
+        // error we truncate back so the buffer stays consistent.
+        let buf_start = self.stmt_buf.len();
+
+        let has_strict_directive = allow_directives && self.input.cur() == Token::Str && {
+            let token_span = self.input.cur_span();
+            if token_span.hi.0 - token_span.lo.0 == 12 {
+                let cur_str = self.input.iter.read_string(token_span);
+                cur_str == "\"use strict\"" || cur_str == "'use strict'"
+            } else {
+                false
+            }
+        };
+
+        let parse_stmts = |p: &mut Self| -> PResult<()> {
+            if let Some(end) = end {
+                loop {
+                    let cur = p.input().cur();
+                    if cur == Token::Eof {
+                        let eof_text = p.input_mut().dump_cur();
+                        p.emit_err(
+                            p.input().cur_span(),
+                            SyntaxError::Expected(format!("{end:?}"), eof_text),
+                        );
+                        break;
+                    }
+                    if cur == end {
+                        break;
+                    }
+
+                    let stmt = p.parse_stmt_like(true, handle_import_export)?;
+                    p.stmt_buf.push(stmt);
+                }
+            } else {
+                while p.input().cur() != Token::Eof {
+                    let stmt = p.parse_stmt_like(true, handle_import_export)?;
+                    p.stmt_buf.push(stmt);
+                }
+            }
+
+            Ok(())
+        };
+
+        let res = if has_strict_directive {
+            self.do_inside_of_context(Context::Strict, parse_stmts)
+        } else {
+            parse_stmts(self)
+        };
+
+        if let Err(err) = res {
+            self.stmt_buf.truncate(buf_start);
+            return Err(err);
+        }
+
+        let stmts = self.stmt_buf.split_off(buf_start);
+
+        if self.input().cur() != Token::Eof && end.is_some() {
+            self.bump();
+        }
+
+        Ok(stmts)
     }
 
     pub(crate) fn parse_block_body<Type: From<Stmt>>(

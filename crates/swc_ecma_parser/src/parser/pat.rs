@@ -771,81 +771,96 @@ impl<I: Tokens> Parser<I> {
     }
 
     pub(crate) fn parse_formal_params(&mut self) -> PResult<Vec<Param>> {
-        let mut params = Vec::new();
-        let mut rest_span = Span::default();
+        // Parse params into the shared scratch buffer, then `split_off` the tail
+        // into an exact-capacity `Vec`. See `Parser::param_buf`.
+        let buf_start = self.param_buf.len();
 
-        while !self.input().is(Token::RParen) {
-            if !rest_span.is_dummy() {
-                self.emit_err(rest_span, SyntaxError::TS1014);
-            }
+        let res = (|p: &mut Self| -> PResult<()> {
+            let mut rest_span = Span::default();
 
-            let param_start = self.cur_pos();
-            let decorators = self.parse_decorators(false)?;
-            let pat_start = self.cur_pos();
-
-            let pat = if let Some(pat) = self.try_parse_flow_anon_formal_param(params.len())? {
-                pat
-            } else if self.input_mut().eat(Token::DotDotDot) {
-                let dot3_token = self.span(pat_start);
-
-                let mut pat = self.parse_binding_pat_or_ident(false)?;
-
-                if self.input_mut().eat(Token::Eq) {
-                    let right = self.parse_assignment_expr()?;
-                    self.emit_err(pat.span(), SyntaxError::TS1048);
-                    pat = AssignPat {
-                        span: self.span(pat_start),
-                        left: Box::new(pat),
-                        right,
-                    }
-                    .into();
+            while !p.input().is(Token::RParen) {
+                if !rest_span.is_dummy() {
+                    p.emit_err(rest_span, SyntaxError::TS1014);
                 }
 
-                let type_ann =
-                    if self.input().syntax().typescript() && self.input().is(Token::Colon) {
-                        let cur_pos = self.cur_pos();
-                        let ty = self.parse_ts_type_ann(/* eat_colon */ true, cur_pos)?;
+                let param_start = p.cur_pos();
+                let decorators = p.parse_decorators(false)?;
+                let pat_start = p.cur_pos();
+
+                let cur_len = p.param_buf.len() - buf_start;
+                let pat = if let Some(pat) = p.try_parse_flow_anon_formal_param(cur_len)? {
+                    pat
+                } else if p.input_mut().eat(Token::DotDotDot) {
+                    let dot3_token = p.span(pat_start);
+
+                    let mut pat = p.parse_binding_pat_or_ident(false)?;
+
+                    if p.input_mut().eat(Token::Eq) {
+                        let right = p.parse_assignment_expr()?;
+                        p.emit_err(pat.span(), SyntaxError::TS1048);
+                        pat = AssignPat {
+                            span: p.span(pat_start),
+                            left: Box::new(pat),
+                            right,
+                        }
+                        .into();
+                    }
+
+                    let type_ann = if p.input().syntax().typescript() && p.input().is(Token::Colon)
+                    {
+                        let cur_pos = p.cur_pos();
+                        let ty = p.parse_ts_type_ann(/* eat_colon */ true, cur_pos)?;
                         Some(ty)
                     } else {
                         None
                     };
 
-                rest_span = self.span(pat_start);
-                let pat = RestPat {
-                    span: rest_span,
-                    dot3_token,
-                    arg: Box::new(pat),
-                    type_ann,
-                }
-                .into();
+                    rest_span = p.span(pat_start);
+                    let pat = RestPat {
+                        span: rest_span,
+                        dot3_token,
+                        arg: Box::new(pat),
+                        type_ann,
+                    }
+                    .into();
 
-                if self.syntax().typescript() && self.input_mut().eat(Token::QuestionMark) {
-                    self.emit_err(self.input().prev_span(), SyntaxError::TS1047);
-                    //
+                    if p.syntax().typescript() && p.input_mut().eat(Token::QuestionMark) {
+                        p.emit_err(p.input().prev_span(), SyntaxError::TS1047);
+                        //
+                    }
+
+                    pat
+                } else {
+                    p.parse_formal_param_pat()?
+                };
+                let is_rest = matches!(pat, Pat::Rest(_));
+                if is_rest {
+                    rest_span = pat.span();
                 }
 
-                pat
-            } else {
-                self.parse_formal_param_pat()?
-            };
-            let is_rest = matches!(pat, Pat::Rest(_));
-            if is_rest {
-                rest_span = pat.span();
+                p.param_buf.push(Param {
+                    span: p.span(param_start),
+                    decorators,
+                    pat,
+                });
+
+                if !p.input().is(Token::RParen) {
+                    expect!(p, Token::Comma);
+                    if is_rest && p.input().is(Token::RParen) {
+                        p.emit_err(p.input().prev_span(), SyntaxError::CommaAfterRestElement);
+                    }
+                }
             }
 
-            params.push(Param {
-                span: self.span(param_start),
-                decorators,
-                pat,
-            });
+            Ok(())
+        })(self);
 
-            if !self.input().is(Token::RParen) {
-                expect!(self, Token::Comma);
-                if is_rest && self.input().is(Token::RParen) {
-                    self.emit_err(self.input().prev_span(), SyntaxError::CommaAfterRestElement);
-                }
-            }
+        if let Err(err) = res {
+            self.param_buf.truncate(buf_start);
+            return Err(err);
         }
+
+        let params = self.param_buf.split_off(buf_start);
 
         if self.syntax().flow() && !self.ctx().contains(Context::InType) {
             let in_declare = self.ctx().contains(Context::InDeclare);
